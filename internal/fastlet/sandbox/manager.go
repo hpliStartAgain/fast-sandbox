@@ -96,6 +96,10 @@ type SandboxManager struct {
 	heartbeatSequence atomic.Uint64
 	// sandboxes  sandboxID -> metadata
 	sandboxes map[string]*SandboxMetadata
+	// createDeletePending remembers that a strict DELETE was accepted while
+	// Create was still committing the runtime. The runtime is only torn down
+	// after that Create path has produced the concrete metadata owner.
+	createDeletePending map[string]bool
 	// snapshots tracks in-memory snapshot tasks keyed by the SandboxSnapshot
 	// UID (snapshot.go). Tasks are ephemeral and never survive a restart.
 	snapshots map[string]*snapshotTask
@@ -197,15 +201,16 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		diagnostics:     make(map[string][]fastletapi.SandboxDiagnosticEvent),
 		cacheTracker:    fastletcache.NewTracker(cacheSource, config.CacheEpoch, fastletcache.DefaultMaxInventory),
 		cacheProtection: protection, warmImages: append([]string(nil), config.WarmImages...),
-		warmImageStates:  warmImageStates,
-		registryProvider: config.RegistryProvider,
-		readinessChanged: make(chan struct{}),
-		routePublisher:   config.RoutePublisher,
-		dataPlaneWorkers: make(map[string]dataPlaneWorker),
-		imageBootWorkers: make(map[string]imageBootWorker),
-		runtimeMessages:  make(map[string]string),
-		sandboxes:        make(map[string]*SandboxMetadata),
-		snapshots:        make(map[string]*snapshotTask),
+		warmImageStates:     warmImageStates,
+		registryProvider:    config.RegistryProvider,
+		readinessChanged:    make(chan struct{}),
+		routePublisher:      config.RoutePublisher,
+		dataPlaneWorkers:    make(map[string]dataPlaneWorker),
+		imageBootWorkers:    make(map[string]imageBootWorker),
+		runtimeMessages:     make(map[string]string),
+		sandboxes:           make(map[string]*SandboxMetadata),
+		createDeletePending: make(map[string]bool),
+		snapshots:           make(map[string]*snapshotTask),
 	}
 	if manager.actionManager != nil {
 		manager.actionManager.SetChangeNotifier(manager.actionStateChanged)

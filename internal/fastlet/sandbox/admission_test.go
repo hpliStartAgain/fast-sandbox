@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -48,16 +49,81 @@ type failingDeleteActionCaller struct {
 	deleteCalls atomic.Int32
 }
 
+type legacyOnlyActionCaller struct {
+	statusCalls atomic.Int32
+	invokeCalls atomic.Int32
+}
+
+func (c *legacyOnlyActionCaller) Status(_ context.Context, _ int32, _ string) (actionapi.HandlerStatus, error) {
+	c.statusCalls.Add(1)
+	return actionapi.HandlerStatus{APIVersion: actionapi.APIVersion, Ready: true, InstanceID: "legacy-egress"}, nil
+}
+
+func (c *legacyOnlyActionCaller) Invoke(_ context.Context, _ int32, _ actionapi.Request) error {
+	c.invokeCalls.Add(1)
+	return nil
+}
+
+func (*legacyOnlyActionCaller) Relay(context.Context, int32, string, actionapi.Owner, string, string, []byte) (int, []byte, error) {
+	return http.StatusNotFound, nil, nil
+}
+
+type strictDeleteActionCaller struct {
+	mu          sync.Mutex
+	owner       actionapi.Owner
+	ownerSet    bool
+	retired     bool
+	failRemove  bool
+	removeCalls int
+}
+
+func (c *strictDeleteActionCaller) Status(_ context.Context, _ int32, apiVersion string) (actionapi.HandlerStatus, error) {
+	return actionapi.HandlerStatus{APIVersion: apiVersion, Ready: true, InstanceID: "handler-v2", OwnerStatus: true}, nil
+}
+
+func (c *strictDeleteActionCaller) Invoke(_ context.Context, _ int32, request actionapi.Request) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch request.Operation {
+	case actionapi.OperationSetBinding:
+		if request.Owner == nil {
+			return errors.New("Actions v2 SET omitted owner")
+		}
+		c.owner, c.ownerSet = *request.Owner, true
+	case actionapi.OperationRemoveBinding:
+		c.removeCalls++
+		if c.failRemove {
+			return errors.New("injected strict REMOVE timeout")
+		}
+		c.retired = true
+	}
+	return nil
+}
+
+func (c *strictDeleteActionCaller) Relay(_ context.Context, _ int32, apiVersion string, owner actionapi.Owner, method, path string, _ []byte) (int, []byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if apiVersion != actionapi.APIVersionV2 || method != http.MethodGet || path != "/_fastlet/v2/owners/"+owner.SandboxUID || !c.ownerSet || c.owner != owner {
+		return http.StatusConflict, nil, nil
+	}
+	state := actionapi.OwnerStateCurrent
+	if c.retired {
+		state = actionapi.OwnerStateRetired
+	}
+	body, err := json.Marshal(actionapi.OwnerObservation{State: state, Owner: owner})
+	return http.StatusOK, body, err
+}
+
 type restartAwareActionCaller struct {
 	mu       sync.Mutex
 	instance string
 	block    <-chan struct{}
 }
 
-func (c *restartAwareActionCaller) Status(context.Context, int32) (actionapi.HandlerStatus, error) {
+func (c *restartAwareActionCaller) Status(_ context.Context, _ int32, apiVersion string) (actionapi.HandlerStatus, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return actionapi.HandlerStatus{APIVersion: actionapi.APIVersion, Ready: true, InstanceID: c.instance}, nil
+	return actionapi.HandlerStatus{APIVersion: apiVersion, Ready: true, InstanceID: c.instance, OwnerStatus: apiVersion == actionapi.APIVersionV2}, nil
 }
 
 func (c *restartAwareActionCaller) Invoke(ctx context.Context, _ int32, _ actionapi.Request) error {
@@ -87,13 +153,13 @@ func (c *restartAwareActionCaller) setInvokeBlock(block <-chan struct{}) {
 	c.mu.Unlock()
 }
 
-func (c *restartAwareActionCaller) Relay(ctx context.Context, _ int32, _, _, _ string, _ []byte) (int, []byte, error) {
+func (c *restartAwareActionCaller) Relay(ctx context.Context, _ int32, _ string, _ actionapi.Owner, _, _ string, _ []byte) (int, []byte, error) {
 	c.Invoke(ctx, 0, actionapi.Request{})
 	return http.StatusOK, nil, nil
 }
 
-func (*failingDeleteActionCaller) Status(context.Context, int32) (actionapi.HandlerStatus, error) {
-	return actionapi.HandlerStatus{APIVersion: actionapi.APIVersion, Ready: true, InstanceID: "handler-a"}, nil
+func (*failingDeleteActionCaller) Status(_ context.Context, _ int32, apiVersion string) (actionapi.HandlerStatus, error) {
+	return actionapi.HandlerStatus{APIVersion: apiVersion, Ready: true, InstanceID: "handler-a", OwnerStatus: apiVersion == actionapi.APIVersionV2}, nil
 }
 
 func (c *failingDeleteActionCaller) Invoke(_ context.Context, _ int32, request actionapi.Request) error {
@@ -104,7 +170,7 @@ func (c *failingDeleteActionCaller) Invoke(_ context.Context, _ int32, request a
 	return nil
 }
 
-func (c *failingDeleteActionCaller) Relay(ctx context.Context, _ int32, _, _, _ string, _ []byte) (int, []byte, error) {
+func (c *failingDeleteActionCaller) Relay(ctx context.Context, _ int32, _ string, _ actionapi.Owner, _, _ string, _ []byte) (int, []byte, error) {
 	return http.StatusOK, nil, nil
 }
 
@@ -757,6 +823,89 @@ func TestActionDeleteFailureDoesNotBlockRuntimeDeletion(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestActionsV2DeleteKeepsRuntimeUntilExactRemoveAcknowledged(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	caller := &strictDeleteActionCaller{failRemove: true}
+	actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{
+		Name: "egress", TargetHTTPPort: 18080,
+	}}, actionapi.APIVersionV2, caller)
+	require.NoError(t, err)
+	probeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actionManager.Start(probeCtx)
+	require.Eventually(t, actionManager.Ready, time.Second, 10*time.Millisecond)
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", ActionManager: actionManager,
+	})
+	require.NoError(t, err)
+	identity := fastletapi.SandboxIdentity{
+		SandboxUID: "uid-v2", Namespace: "default", Name: "sandbox-v2", FastletPodUID: "pod-uid-a",
+		InstanceGeneration: 1, AssignmentAttempt: 1, RouteGeneration: 1, RuntimeInstanceID: "runtime-v2",
+	}
+	metadata := &SandboxMetadata{
+		Config: fastletapi.RuntimeSandboxConfig{Identity: identity, ActionsAPIVersion: actionapi.APIVersionV2, Desired: fastletapi.SandboxDesiredSpec{
+			Image: "alpine:latest",
+		}},
+		Allocation: fastletapi.RuntimeAllocation{Network: fastletapi.NetworkAllocation{
+			IP: "172.30.0.2", Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24", HostVeth: "host-v2",
+		}},
+		Phase: sandboxStateRunning, AppliedGeneration: 1,
+	}
+	manager.sandboxes[identity.SandboxUID] = metadata
+	_, _, err = actionManager.Reconcile(context.Background(), actionAttachment(metadata), 1, []fastletaction.DesiredInput{{Handler: "egress", Input: `{}`}})
+	require.NoError(t, err)
+
+	request := &fastletapi.DeleteSandboxRequest{Identity: identity}
+	_, err = manager.DeleteSandboxContext(context.Background(), request)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "strict REMOVE_BINDING remains pending")
+	_, deleteCalls := runtime.counts()
+	require.Zero(t, deleteCalls, "unknown strict REMOVE outcome must block runtime teardown")
+	require.Equal(t, sandboxStateTerminating, manager.sandboxes[identity.SandboxUID].Phase)
+
+	caller.mu.Lock()
+	caller.failRemove = false
+	caller.mu.Unlock()
+	_, err = manager.DeleteSandboxContext(context.Background(), request)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, deleteCalls = runtime.counts()
+		return deleteCalls == 1
+	}, time.Second, 10*time.Millisecond, "runtime teardown starts only after exact-owner REMOVE ACK")
+}
+
+func TestActionsV2DeleteDoesNotDowngradeMissingOrUnknownRuntimeMode(t *testing.T) {
+	for _, storedVersion := range []string{"", "sandbox.fast.io/actions/v3"} {
+		t.Run(fmt.Sprintf("stored-%q", storedVersion), func(t *testing.T) {
+			runtime := newAdmissionRuntime()
+			caller := &strictDeleteActionCaller{}
+			actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{Name: "egress", TargetHTTPPort: 18080}}, actionapi.APIVersionV2, caller)
+			require.NoError(t, err)
+			probeCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			actionManager.Start(probeCtx)
+			require.Eventually(t, actionManager.Ready, time.Second, 10*time.Millisecond)
+			manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{Capacity: 1, FastletPodUID: "pod-uid-a", ActionManager: actionManager})
+			require.NoError(t, err)
+			identity := fastletapi.SandboxIdentity{
+				SandboxUID: "uid-unmarked", Namespace: "default", Name: "sandbox-unmarked", FastletPodUID: "pod-uid-a",
+				InstanceGeneration: 1, AssignmentAttempt: 1, RouteGeneration: 1, RuntimeInstanceID: "runtime-unmarked",
+			}
+			manager.sandboxes[identity.SandboxUID] = &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{
+				Identity: identity, ActionsAPIVersion: storedVersion, Desired: fastletapi.SandboxDesiredSpec{Image: "alpine:latest"},
+			}, Phase: sandboxStateRunning, AppliedGeneration: 1}
+
+			_, err = manager.DeleteSandboxContext(context.Background(), &fastletapi.DeleteSandboxRequest{Identity: identity})
+			require.Error(t, err)
+			_, deleteCalls := runtime.counts()
+			require.Zero(t, deleteCalls, "unknown or absent durable mode must not use legacy teardown")
+			caller.mu.Lock()
+			require.Zero(t, caller.removeCalls)
+			caller.mu.Unlock()
+		})
+	}
+}
+
 func TestAtomicCreateRejectsUnavailableNetworkResource(t *testing.T) {
 	available := false
 	runtime := newAdmissionRuntime()
@@ -768,6 +917,81 @@ func TestAtomicCreateRejectsUnavailableNetworkResource(t *testing.T) {
 	available = true
 	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-a", 1, 1))
 	require.NoError(t, err)
+}
+
+func TestActionsV2CreateRejectsSnapshotRestoreBeforeRuntimeEffects(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	caller := &restartAwareActionCaller{instance: "handler-1"}
+	actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{
+		Name: "egress", TargetHTTPPort: 18080,
+	}}, actionapi.APIVersionV2, caller)
+	require.NoError(t, err)
+	probeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actionManager.Start(probeCtx)
+	require.Eventually(t, actionManager.Ready, time.Second, 10*time.Millisecond)
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", ActionManager: actionManager,
+	})
+	require.NoError(t, err)
+	request := ensureRequest("sandbox-v2-restore", 1, 1)
+	request.Sandbox.Restore = &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/manifest", ArtifactDigest: "sha256:digest"}
+
+	_, err = manager.CreateSandbox(context.Background(), request)
+	require.Error(t, err)
+	var failure *fastletapi.FastletError
+	require.ErrorAs(t, err, &failure)
+	require.Equal(t, fastletapi.ErrorSnapshotUnsupported, failure.Code)
+	ensureCalls, deleteCalls := runtime.counts()
+	require.Zero(t, ensureCalls, "unsupported restore must not reach the runtime")
+	require.Zero(t, deleteCalls)
+	admission, _, _ := manager.State()
+	require.Zero(t, admission.Used)
+}
+
+func TestActionsV2HandlerMismatchRejectsCreateBeforeRuntimeEffects(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	caller := &legacyOnlyActionCaller{}
+	actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{Name: "egress", TargetHTTPPort: 18080}}, actionapi.APIVersionV2, caller)
+	require.NoError(t, err)
+	probeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actionManager.Start(probeCtx)
+	require.Eventually(t, func() bool { return caller.statusCalls.Load() > 0 }, time.Second, 10*time.Millisecond)
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{Capacity: 1, FastletPodUID: "pod-uid-a", ActionManager: actionManager})
+	require.NoError(t, err)
+	response, err := manager.CreateSandbox(context.Background(), ensureRequest("sandbox-v2-mismatch", 1, 1))
+	require.Error(t, err)
+	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, response.Disposition)
+	var failure *fastletapi.FastletError
+	require.ErrorAs(t, err, &failure)
+	require.Equal(t, fastletapi.ErrorActionUnavailable, failure.Code)
+	ensureCalls, deleteCalls := runtime.counts()
+	require.Zero(t, ensureCalls)
+	require.Zero(t, deleteCalls)
+	require.Zero(t, caller.invokeCalls.Load())
+}
+
+func TestCreatePersistsActionsModeFromRuntimePlanNotCallerRequest(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	caller := &restartAwareActionCaller{instance: "handler-1"}
+	actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{
+		Name: "egress", TargetHTTPPort: 18080,
+	}}, actionapi.APIVersionV2, caller)
+	require.NoError(t, err)
+	probeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actionManager.Start(probeCtx)
+	require.Eventually(t, actionManager.Ready, time.Second, 10*time.Millisecond)
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", ActionManager: actionManager,
+	})
+	require.NoError(t, err)
+	request := ensureRequest("sandbox-v2-mode", 1, 1)
+	_, err = manager.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, actionapi.APIVersionV2, manager.sandboxes[request.Identity.SandboxUID].Config.ActionsAPIVersion)
+	require.Equal(t, actionapi.APIVersionV2, runtime.sandboxes[request.Identity.SandboxUID].Config.ActionsAPIVersion)
 }
 
 func TestDeletedIdentityCannotBeResurrectedByDelayedCreate(t *testing.T) {
