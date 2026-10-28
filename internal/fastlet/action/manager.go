@@ -996,6 +996,21 @@ func (m *Manager) ConfirmOwnerRetired(ctx context.Context, attachment Attachment
 	return nil
 }
 
+// CheckCreateOwner consumes the durable retirement fence before runtime boot.
+// A current observation is not a claim that retirement is not in progress.
+func (m *Manager) CheckCreateOwner(ctx context.Context, attachment Attachment) error {
+	for _, handler := range m.handlers {
+		observed, err := m.observeOwner(ctx, handler.TargetHTTPPort, ownerFromAttachment(attachment))
+		if err != nil {
+			return err
+		}
+		if observed.State == actionapi.OwnerStateRetired {
+			return errors.New("Sandbox owner is retired")
+		}
+	}
+	return nil
+}
+
 func (m *Manager) deleteState(ctx context.Context, state *sandboxState, expected Attachment) error {
 	sandboxUID := expected.SandboxUID
 	if !state.lockOperations(ctx) {

@@ -98,7 +98,7 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req *fastletapi.Crea
 	placeholder := reservation.placeholder
 	sandboxUID := input.Sandbox.Identity.SandboxUID
 	m.recordDiagnostic(sandboxUID, "info", "admission", sandboxStateCreating, "Fastlet admission accepted; atomic runtime creation started")
-	if bindingFailure, currentAdmission := m.registerDesiredBindings(placeholder, req); bindingFailure != nil {
+	if bindingFailure, currentAdmission := m.registerDesiredBindings(ctx, placeholder, req); bindingFailure != nil {
 		return createFailureWithDisposition(bindingFailure, currentAdmission, fastletapi.CreateDispositionRejectedBeforeSideEffects)
 	}
 	tBindings = time.Now()
@@ -245,8 +245,18 @@ func (m *SandboxManager) reserveSandboxForCreate(req *fastletapi.CreateSandboxRe
 	return result, nil
 }
 
-func (m *SandboxManager) registerDesiredBindings(placeholder *SandboxMetadata, req *fastletapi.CreateSandboxRequest) (*fastletapi.FastletError, fastletapi.AdmissionStatus) {
-	if err := m.registerDesiredActions(placeholder, req.SpecGeneration, req.ActionBindings); err != nil {
+func (m *SandboxManager) registerDesiredBindings(ctx context.Context, placeholder *SandboxMetadata, req *fastletapi.CreateSandboxRequest) (*fastletapi.FastletError, fastletapi.AdmissionStatus) {
+	var err error
+	strict := m.requiresStrictActionHandling(placeholder.Config.ActionsAPIVersion)
+	if strict && m.actionManager != nil {
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err = m.actionManager.CheckCreateOwner(checkCtx, actionAttachment(placeholder))
+		cancel()
+	}
+	if err == nil {
+		err = m.registerDesiredActions(placeholder, req.SpecGeneration, req.ActionBindings)
+	}
+	if err != nil {
 		m.mu.Lock()
 		sandboxUID := placeholder.Config.Identity.SandboxUID
 		if m.sandboxes[sandboxUID] == placeholder {
@@ -254,7 +264,7 @@ func (m *SandboxManager) registerDesiredBindings(placeholder *SandboxMetadata, r
 		}
 		admission := m.admissionStatusLocked()
 		m.mu.Unlock()
-		return fastletErrorWithCause(fastletapi.ErrorActionUnavailable, err.Error(), false, err), admission
+		return fastletErrorWithCause(fastletapi.ErrorActionUnavailable, err.Error(), strict, err), admission
 	}
 	return nil, fastletapi.AdmissionStatus{}
 }
@@ -527,6 +537,11 @@ func (m *SandboxManager) InspectSandbox(req *fastletapi.InspectSandboxRequest) (
 		return &fastletapi.InspectSandboxResponse{Error: failure}, failure
 	}
 	m.mu.RLock()
+	if m.recovering || !m.runtimeReady {
+		m.mu.RUnlock()
+		failure := fastletError(fastletapi.ErrorRuntimeUnavailable, "runtime inventory recovery is incomplete", true)
+		return &fastletapi.InspectSandboxResponse{Error: failure}, failure
+	}
 	metadata := m.sandboxes[req.Identity.SandboxUID]
 	if metadata == nil {
 		m.mu.RUnlock()
@@ -566,9 +581,24 @@ func (m *SandboxManager) DeleteSandboxContext(ctx context.Context, req *fastleta
 		return &fastletapi.DeleteSandboxResponse{Admission: admission, Error: failure}, failure
 	}
 	m.mu.Lock()
+	if m.recovering || !m.runtimeReady {
+		admission := m.admissionStatusLocked()
+		m.mu.Unlock()
+		failure := fastletError(fastletapi.ErrorRuntimeUnavailable, "runtime inventory recovery is incomplete", true)
+		return &fastletapi.DeleteSandboxResponse{Admission: admission, Error: failure}, failure
+	}
 	metadata := m.sandboxes[req.Identity.SandboxUID]
 	wasCreating := false
-	strictActions := metadata != nil && m.requiresStrictActionHandling(metadata.Config.ActionsAPIVersion)
+	strictActions := m.requiresStrictActionHandling("")
+	if metadata != nil {
+		strictActions = m.requiresStrictActionHandling(metadata.Config.ActionsAPIVersion)
+	}
+	ownerMetadata := metadata
+	if metadata == nil && strictActions {
+		ownerMetadata = &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{
+			Identity: req.Identity, ActionsAPIVersion: m.actionManager.APIVersion(),
+		}}
+	}
 	if metadata != nil {
 		if failure := validateIdentityFence(m.fastletPodUID, metadata, req.Identity); failure != nil {
 			admission := m.admissionStatusLocked()
@@ -604,9 +634,9 @@ func (m *SandboxManager) DeleteSandboxContext(ctx context.Context, req *fastleta
 	m.mu.Unlock()
 	// Strict cleanup retains resources until exact-owner retirement succeeds;
 	// the legacy path below continues to report failures without blocking.
-	if metadata != nil && strictActions {
+	if strictActions {
 		deleteCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := m.actionManager.DeleteOwned(deleteCtx, actionAttachment(metadata))
+		err := m.actionManager.DeleteOwned(deleteCtx, actionAttachment(ownerMetadata))
 		cancel()
 		if err != nil {
 			m.recordDiagnostic(req.Identity.SandboxUID, "error", "action", "delete-pending", err.Error())

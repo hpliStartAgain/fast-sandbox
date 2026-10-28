@@ -40,6 +40,8 @@ type admissionRuntime struct {
 	deleteBlock   chan struct{}
 	pullEntered   chan struct{}
 	pullBlock     chan struct{}
+	listEntered   chan struct{}
+	listRelease   chan struct{}
 	pulledImages  []string
 	images        []string
 	resourceReady *bool
@@ -69,12 +71,15 @@ func (*legacyOnlyActionCaller) Relay(context.Context, int32, string, actionapi.O
 }
 
 type strictDeleteActionCaller struct {
-	mu          sync.Mutex
-	owner       actionapi.Owner
-	ownerSet    bool
-	retired     bool
-	failRemove  bool
-	removeCalls int
+	mu              sync.Mutex
+	owner           actionapi.Owner
+	ownerSet        bool
+	retired         bool
+	failRemove      bool
+	failRead        bool
+	removeCalls     int
+	lostRemoveReply bool
+	lastRemove      actionapi.Request
 }
 
 type blockingStrictDeleteActionCaller struct {
@@ -171,10 +176,15 @@ func (c *strictDeleteActionCaller) Invoke(_ context.Context, _ int32, request ac
 		c.owner, c.ownerSet = *request.Owner, true
 	case actionapi.OperationRemoveBinding:
 		c.removeCalls++
+		c.lastRemove = request
 		if c.failRemove {
 			return errors.New("injected strict REMOVE timeout")
 		}
 		c.retired = true
+		c.owner, c.ownerSet = *request.Owner, true
+		if c.lostRemoveReply {
+			return errors.New("injected lost REMOVE response")
+		}
 	}
 	return nil
 }
@@ -182,11 +192,16 @@ func (c *strictDeleteActionCaller) Invoke(_ context.Context, _ int32, request ac
 func (c *strictDeleteActionCaller) Relay(_ context.Context, _ int32, apiVersion string, owner actionapi.Owner, method, path string, _ []byte) (int, []byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if apiVersion != actionapi.APIVersionV2 || method != http.MethodGet || path != "/_fastlet/v2/owners/"+owner.SandboxUID || !c.ownerSet || c.owner != owner {
+	if c.failRead {
+		return 0, nil, errors.New("injected owner read failure")
+	}
+	if apiVersion != actionapi.APIVersionV2 || method != http.MethodGet || path != "/_fastlet/v2/owners/"+owner.SandboxUID || c.ownerSet && c.owner.SandboxUID == owner.SandboxUID && c.owner != owner {
 		return http.StatusConflict, nil, nil
 	}
 	state := actionapi.OwnerStateCurrent
-	if c.retired {
+	if !c.ownerSet || c.owner.SandboxUID != owner.SandboxUID {
+		state = actionapi.OwnerStateAbsent
+	} else if c.retired {
 		state = actionapi.OwnerStateRetired
 	}
 	body, err := json.Marshal(actionapi.OwnerObservation{State: state, Owner: owner})
@@ -413,7 +428,15 @@ func (r *admissionRuntime) DeleteSandbox(_ context.Context, sandboxID string) er
 	return nil
 }
 
-func (r *admissionRuntime) ListManagedSandboxes(context.Context) ([]*SandboxMetadata, error) {
+func (r *admissionRuntime) ListManagedSandboxes(ctx context.Context) ([]*SandboxMetadata, error) {
+	if r.listRelease != nil {
+		close(r.listEntered)
+		select {
+		case <-r.listRelease:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.managed != nil {
@@ -1244,7 +1267,7 @@ func TestActionsV2HandlerMismatchRejectsCreateBeforeRuntimeEffects(t *testing.T)
 
 func TestCreatePersistsActionsModeFromRuntimePlanNotCallerRequest(t *testing.T) {
 	runtime := newAdmissionRuntime()
-	caller := &restartAwareActionCaller{instance: "handler-1"}
+	caller := &strictDeleteActionCaller{}
 	actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{
 		Name: "egress", TargetHTTPPort: 18080,
 	}}, actionapi.APIVersionV2, caller)
@@ -1391,7 +1414,19 @@ func TestRecoveryBlocksReadinessAndRestoresCapacity(t *testing.T) {
 	require.False(t, manager.Ready())
 	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-b", 1, 1))
 	requireFastletCode(t, err, fastletapi.ErrorRuntimeUnavailable)
-	require.NoError(t, manager.Recover(context.Background()))
+	runtime.listEntered, runtime.listRelease = make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(runtime.listRelease) })
+	t.Cleanup(release)
+	done := make(chan error, 1)
+	go func() { done <- manager.Recover(context.Background()) }()
+	<-runtime.listEntered
+	identity := ensureRequest("sandbox-a", 2, 3).Identity
+	_, err = manager.DeleteSandboxContext(context.Background(), &fastletapi.DeleteSandboxRequest{Identity: identity})
+	requireFastletCode(t, err, fastletapi.ErrorRuntimeUnavailable)
+	_, err = manager.InspectSandbox(&fastletapi.InspectSandboxRequest{Identity: identity})
+	requireFastletCode(t, err, fastletapi.ErrorRuntimeUnavailable)
+	release()
+	require.NoError(t, <-done)
 	require.True(t, manager.Ready())
 	admission, recovering, _ := manager.State()
 	require.False(t, recovering)
@@ -1687,4 +1722,61 @@ func TestDeleteBeforeCreateFencesDelayedAdmission(t *testing.T) {
 	require.Zero(t, deletes)
 	admission, _, _ := manager.State()
 	require.Zero(t, admission.Used)
+}
+
+func TestStrictDeleteBeforeCreateSurvivesManagerRestart(t *testing.T) {
+	caller := &strictDeleteActionCaller{failRemove: true}
+	newManager := func() (*SandboxManager, *admissionRuntime) {
+		actions, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{Name: "egress", TargetHTTPPort: 18080}}, actionapi.APIVersionV2, caller)
+		require.NoError(t, err)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		actions.Start(ctx)
+		require.Eventually(t, actions.Ready, time.Second, 10*time.Millisecond)
+		runtime := newAdmissionRuntime()
+		manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{Capacity: 1, FastletPodUID: "pod-uid-a", ActionManager: actions})
+		require.NoError(t, err)
+		return manager, runtime
+	}
+	manager, _ := newManager()
+	request := ensureRequest("never-created", 1, 1)
+	request.Identity.RouteGeneration = 1
+	_, err := manager.DeleteSandboxContext(context.Background(), &fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+	require.Error(t, err, "absence cannot hide failed retirement")
+	caller.mu.Lock()
+	caller.failRemove, caller.lostRemoveReply = false, true
+	caller.mu.Unlock()
+	_, err = manager.DeleteSandboxContext(context.Background(), &fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+	require.NoError(t, err, "exact retired read-back resolves a lost REMOVE response")
+	caller.mu.Lock()
+	require.Equal(t, "legacy", caller.lastRemove.Mode)
+	require.Equal(t, actionOwnerForTest(actionAttachment(&SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{Identity: request.Identity, ActionsAPIVersion: actionapi.APIVersionV2}})), *caller.lastRemove.Owner)
+	caller.mu.Unlock()
+	restarted, runtime := newManager()
+	stale := request.Identity
+	stale.RuntimeInstanceID = "other-runtime"
+	_, err = manager.DeleteSandboxContext(context.Background(), &fastletapi.DeleteSandboxRequest{Identity: stale})
+	require.Error(t, err, "an absent local entry cannot confirm another owner")
+	caller.mu.Lock()
+	caller.failRead = true
+	caller.mu.Unlock()
+	_, err = manager.DeleteSandboxContext(context.Background(), &fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+	require.ErrorContains(t, err, "owner read failure")
+	_, err = restarted.CreateSandbox(context.Background(), request)
+	require.ErrorContains(t, err, "owner read failure")
+	ensures, _ := runtime.counts()
+	require.Zero(t, ensures)
+	caller.mu.Lock()
+	caller.failRead = false
+	caller.mu.Unlock()
+	_, err = restarted.CreateSandbox(context.Background(), request)
+	require.ErrorContains(t, err, "retired")
+	ensures, _ = runtime.counts()
+	require.Zero(t, ensures, "reject before starting an orphan runtime")
+	admission, _, _ := restarted.State()
+	require.Zero(t, admission.Used)
+	_, err = restarted.CreateSandbox(context.Background(), ensureRequest("new-uid", 1, 1))
+	require.NoError(t, err, "a retired UID does not prevent a distinct new UID")
+	ensures, _ = runtime.counts()
+	require.Equal(t, 1, ensures)
 }
