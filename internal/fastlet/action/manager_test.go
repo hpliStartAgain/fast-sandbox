@@ -535,6 +535,7 @@ func TestActionsV2HandlerRestartReplaysSameOwnerBeforeReachedHooks(t *testing.T)
 	}, requestOperations(replayed))
 	for _, request := range replayed {
 		require.Equal(t, actionapi.APIVersionV2, request.request.APIVersion)
+		require.Equal(t, "legacy", request.request.Mode)
 		require.NotNil(t, request.request.Owner)
 		require.Equal(t, ownerFromAttachment(owner), *request.request.Owner)
 	}
@@ -620,4 +621,23 @@ func mustStatus(t *testing.T, manager *Manager, uid string) fastletapi.ActionBin
 	statuses, _ := manager.Statuses(uid)
 	require.Len(t, statuses, 1)
 	return statuses[0]
+}
+
+func TestActionsV2AbsentOwnerNeedsDurableRemoveBeforeCleanup(t *testing.T) {
+	caller := &fakeCaller{instanceID: "handler-1", fail: make(map[actionapi.Operation]int)}
+	manager := readyManagerWithAPIVersion(t, []apiv1alpha2.ActionHandler{strictHandler("egress", 18080)}, actionapi.APIVersionV2, caller)
+	owner := attachment("a")
+	owner.APIVersion = actionapi.APIVersionV2
+	owner.FastletPodUID = "pod-a"
+	body, err := json.Marshal(actionapi.OwnerObservation{State: actionapi.OwnerStateAbsent, Owner: ownerFromAttachment(owner)})
+	require.NoError(t, err)
+	caller.mu.Lock()
+	caller.relayBody = body
+	caller.mu.Unlock()
+	require.Error(t, manager.ConfirmOwnerRetired(context.Background(), owner), "absence alone is not a retirement fence")
+	require.NoError(t, manager.DeleteOwned(context.Background(), owner))
+	requests := caller.snapshot()
+	require.Len(t, requests, 1)
+	require.Equal(t, actionapi.OperationRemoveBinding, requests[0].request.Operation)
+	require.Equal(t, "legacy", requests[0].request.Mode)
 }

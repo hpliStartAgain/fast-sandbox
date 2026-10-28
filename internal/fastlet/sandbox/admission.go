@@ -558,9 +558,8 @@ func (m *SandboxManager) DeleteSandbox(req *fastletapi.DeleteSandboxRequest) (*f
 	return m.DeleteSandboxContext(context.Background(), req)
 }
 
-// DeleteSandboxContext keeps the bounded, best-effort Action Handler cleanup
-// attempt ahead of runtime and network teardown. Handler failure is diagnostic
-// only and cannot block deletion or finalizer completion.
+// DeleteSandboxContext retires strict Action owners before runtime teardown.
+// Legacy Handler cleanup remains bounded and best-effort.
 func (m *SandboxManager) DeleteSandboxContext(ctx context.Context, req *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error) {
 	if failure := m.validateIdentityTarget(deleteIdentity(req)); failure != nil {
 		admission, _, _ := m.State()
@@ -603,13 +602,8 @@ func (m *SandboxManager) DeleteSandboxContext(ctx context.Context, req *fastleta
 	m.recordDiagnosticLocked(req.Identity.SandboxUID, "info", "admission", sandboxStateTerminating, "declarative deletion accepted; new Binding and Hook work is fenced")
 	m.signalReadinessChangedLocked()
 	m.mu.Unlock()
-	// Best-effort Handler cleanup stays ahead of runtime and network teardown
-	// and cannot block deletion. Decision recorded for OSEP-0022: we ship
-	// error-level logging only — durable diagnostics and ack-gated slot
-	// release are deferred until the observed failure frequency justifies
-	// designing them. A lost REMOVE_BINDING leaves a stale subject on the
-	// Handler while its slot IP can be reused, so this log line is the
-	// operator's only signal today.
+	// Strict cleanup retains resources until exact-owner retirement succeeds;
+	// the legacy path below continues to report failures without blocking.
 	if metadata != nil && strictActions {
 		deleteCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		err := m.actionManager.DeleteOwned(deleteCtx, actionAttachment(metadata))
@@ -638,6 +632,19 @@ func (m *SandboxManager) DeleteSandboxContext(ctx context.Context, req *fastleta
 			m.mu.Unlock()
 		}
 		go m.asyncDelete(req.Identity.SandboxUID, metadata)
+	} else if metadata != nil && strictActions && wasCreating {
+		// A canceled image worker can finish its one cleanup attempt while
+		// REMOVE_BINDING is still in flight. If it observed the owner as current,
+		// queue cleanup again after this caller has received the retirement ACK.
+		m.mu.Lock()
+		startCleanup := m.sandboxes[req.Identity.SandboxUID] == metadata && !m.createDeletePending[req.Identity.SandboxUID]
+		if startCleanup {
+			metadata.Phase = sandboxStateDeleting
+		}
+		m.mu.Unlock()
+		if startCleanup {
+			go m.asyncDelete(req.Identity.SandboxUID, metadata)
+		}
 	}
 	admission, _, _ := m.State()
 	return &fastletapi.DeleteSandboxResponse{Admission: admission}, nil
@@ -659,8 +666,26 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit 
 		return fmt.Errorf("runtime capability is not ready: %s: %s", report.Reason, report.Message)
 	}
 	if recoverer, ok := m.runtime.(RuntimeResourceRecoverer); ok {
-		if err := recoverer.RecoverRuntimeResources(ctx, managed); err != nil {
+		retireOwner := func(retireCtx context.Context, metadata *SandboxMetadata) error {
+			if metadata == nil {
+				return errors.New("runtime recovery cannot retire an owner without metadata")
+			}
+			if !m.requiresStrictActionHandling(metadata.Config.ActionsAPIVersion) {
+				return nil
+			}
+			if m.actionManager == nil {
+				return errors.New("strict Action Handler is unavailable; runtime recovery is blocked")
+			}
+			return m.actionManager.DeleteOwned(retireCtx, actionAttachment(metadata))
+		}
+		if err := recoverer.RecoverRuntimeResources(ctx, managed, retireOwner); err != nil {
 			return fmt.Errorf("recover runtime resources: %w", err)
+		}
+		// Resource recovery may have removed dead runtimes. Re-read durable
+		// metadata so a deleted VM is not reintroduced into the live manager map.
+		managed, err = m.runtime.ListManagedSandboxes(ctx)
+		if err != nil {
+			return fmt.Errorf("list Sandboxes after runtime resource recovery: %w", err)
 		}
 	}
 	recovered := make(map[string]*SandboxMetadata, len(managed))

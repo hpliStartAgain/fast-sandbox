@@ -972,6 +972,30 @@ func (m *Manager) DeleteOwned(ctx context.Context, attachment Attachment) error 
 	return m.deleteState(ctx, state, attachment)
 }
 
+// ConfirmOwnerRetired performs a read-only confirmation that every configured
+// Handler has retired the exact Actions v2 owner. Runtime teardown uses this
+// after asynchronous lifecycle paths, where a previous REMOVE may have failed
+// or its result may be unknown.
+func (m *Manager) ConfirmOwnerRetired(ctx context.Context, attachment Attachment) error {
+	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
+		return err
+	}
+	if m.APIVersion() != actionapi.APIVersionV2 || !ownerFromAttachment(attachment).Valid() {
+		return errors.New("Actions v2 retirement confirmation requires a complete owner")
+	}
+	owner := ownerFromAttachment(attachment)
+	for _, handler := range m.handlers {
+		observed, err := m.observeOwner(ctx, handler.TargetHTTPPort, owner)
+		if err != nil {
+			return fmt.Errorf("confirm Action Handler %s owner retirement: %w", handler.Name, err)
+		}
+		if observed.State != actionapi.OwnerStateRetired {
+			return fmt.Errorf("Action Handler %s still owns the Sandbox", handler.Name)
+		}
+	}
+	return nil
+}
+
 func (m *Manager) deleteState(ctx context.Context, state *sandboxState, expected Attachment) error {
 	sandboxUID := expected.SandboxUID
 	if !state.lockOperations(ctx) {
@@ -1075,7 +1099,7 @@ func (m *Manager) deleteRemoteHandler(ctx context.Context, name string, attachme
 	if observed.State == actionapi.OwnerStateRetired {
 		return nil
 	}
-	if observed.State != actionapi.OwnerStateCurrent || !observed.Owner.Matches(owner) {
+	if (observed.State != actionapi.OwnerStateCurrent && observed.State != actionapi.OwnerStateAbsent) || !observed.Owner.Matches(owner) {
 		return fmt.Errorf("Action Handler %s reports an unknown or mismatched owner", name)
 	}
 	instanceID, _ := m.handlerInstance(name)
@@ -1108,7 +1132,7 @@ func (m *Manager) observeOwner(ctx context.Context, port int32, owner actionapi.
 	if err := json.Unmarshal(body, &observation); err != nil {
 		return observation, fmt.Errorf("decode owner read-back: %w", err)
 	}
-	if observation.State != actionapi.OwnerStateCurrent && observation.State != actionapi.OwnerStateRetired || !observation.Owner.Matches(owner) {
+	if observation.State != actionapi.OwnerStateCurrent && observation.State != actionapi.OwnerStateRetired && observation.State != actionapi.OwnerStateAbsent || !observation.Owner.Matches(owner) {
 		return observation, errors.New("owner read-back did not confirm the requested owner")
 	}
 	return observation, nil
@@ -1356,6 +1380,7 @@ func buildRequest(operation actionapi.Operation, invocationID string, generation
 	if apiVersion == actionapi.APIVersionV2 {
 		owner := ownerFromAttachment(attachment)
 		request.Owner = &owner
+		request.Mode = "legacy"
 	}
 	return request
 }

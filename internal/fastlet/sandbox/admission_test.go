@@ -77,6 +77,85 @@ type strictDeleteActionCaller struct {
 	removeCalls int
 }
 
+type blockingStrictDeleteActionCaller struct {
+	*strictDeleteActionCaller
+	removeEntered    chan struct{}
+	removeRelease    <-chan struct{}
+	removeStarted    chan struct{}
+	removeStartOnce  sync.Once
+	ownerReadEntered chan struct{}
+	ownerReadRelease <-chan struct{}
+}
+
+type gatedDeleteBootRuntime struct {
+	*asyncBootRuntime
+	deliveryCalls   atomic.Int32
+	deliveryEntered chan struct{}
+	deliveryRelease <-chan struct{}
+}
+
+func (r *gatedDeleteBootRuntime) DeliverImage(context.Context, string) (ImageDeliveryStatus, error) {
+	// Create polls synchronously before parking; only gate the later worker.
+	if r.deliveryCalls.Add(1) == 1 {
+		return ImageDelivering, nil
+	}
+	select {
+	case r.deliveryEntered <- struct{}{}:
+	default:
+	}
+	<-r.deliveryRelease
+	return ImageDelivering, nil
+}
+
+func (c *blockingStrictDeleteActionCaller) Invoke(ctx context.Context, port int32, request actionapi.Request) error {
+	if request.Operation == actionapi.OperationRemoveBinding {
+		c.removeStartOnce.Do(func() { close(c.removeStarted) })
+		select {
+		case c.removeEntered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-c.removeRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return c.strictDeleteActionCaller.Invoke(ctx, port, request)
+}
+
+func (c *blockingStrictDeleteActionCaller) Relay(ctx context.Context, port int32, apiVersion string, owner actionapi.Owner, method, path string, body []byte) (int, []byte, error) {
+	status, response, err := c.strictDeleteActionCaller.Relay(ctx, port, apiVersion, owner, method, path, body)
+	if method == http.MethodGet {
+		select {
+		case <-c.removeStarted:
+		default:
+			return status, response, err
+		}
+		select {
+		case c.ownerReadEntered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-c.ownerReadRelease:
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
+		}
+	}
+	return status, response, err
+}
+
+type recoveryAdmissionRuntime struct {
+	*admissionRuntime
+	recoverFn func(context.Context, []*SandboxMetadata, runtimecontract.ResourceRecoveryOwnerRetirer) error
+}
+
+func (r *recoveryAdmissionRuntime) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
+	if r.recoverFn == nil {
+		return nil
+	}
+	return r.recoverFn(ctx, managed, retireOwner)
+}
+
 func (c *strictDeleteActionCaller) Status(_ context.Context, _ int32, apiVersion string) (actionapi.HandlerStatus, error) {
 	return actionapi.HandlerStatus{APIVersion: apiVersion, Ready: true, InstanceID: "handler-v2", OwnerStatus: true}, nil
 }
@@ -112,6 +191,15 @@ func (c *strictDeleteActionCaller) Relay(_ context.Context, _ int32, apiVersion 
 	}
 	body, err := json.Marshal(actionapi.OwnerObservation{State: state, Owner: owner})
 	return http.StatusOK, body, err
+}
+
+func actionOwnerForTest(attachment fastletaction.Attachment) actionapi.Owner {
+	return actionapi.Owner{
+		SandboxUID: attachment.SandboxUID, FastletPodUID: attachment.FastletPodUID,
+		RuntimeInstanceID: attachment.RuntimeInstanceID, InstanceGeneration: attachment.InstanceGeneration,
+		AssignmentAttempt: attachment.AssignmentAttempt, RouteGeneration: attachment.RouteGeneration,
+		AttachmentID: attachment.ID,
+	}
 }
 
 type restartAwareActionCaller struct {
@@ -872,6 +960,188 @@ func TestActionsV2DeleteKeepsRuntimeUntilExactRemoveAcknowledged(t *testing.T) {
 		_, deleteCalls = runtime.counts()
 		return deleteCalls == 1
 	}, time.Second, 10*time.Millisecond, "runtime teardown starts only after exact-owner REMOVE ACK")
+}
+
+func TestActionsV2ColdCreateDeleteWaitsForRetirementAndCanRetry(t *testing.T) {
+	runtime := newAsyncBootRuntime(ImageDelivering)
+	caller := &strictDeleteActionCaller{failRemove: true}
+	actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{
+		Name: "egress", TargetHTTPPort: 18080,
+	}}, actionapi.APIVersionV2, caller)
+	require.NoError(t, err)
+	probeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actionManager.Start(probeCtx)
+	require.Eventually(t, actionManager.Ready, time.Second, 10*time.Millisecond)
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", ActionManager: actionManager,
+	})
+	require.NoError(t, err)
+	request := ensureRequest("cold-v2-delete", 1, 1)
+	request.ActionBindings = []fastletapi.ActionBindingInput{{Handler: "egress", Input: `{}`}}
+	created, err := manager.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.RuntimeStateCreating, created.Sandbox.Runtime.State)
+
+	manager.mu.RLock()
+	metadata := manager.sandboxes[request.Identity.SandboxUID]
+	manager.mu.RUnlock()
+	attachment := actionAttachment(metadata)
+	caller.mu.Lock()
+	caller.owner, caller.ownerSet = actionOwnerForTest(attachment), true
+	caller.mu.Unlock()
+
+	_, err = manager.DeleteSandboxContext(context.Background(), &fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+	require.ErrorContains(t, err, "strict REMOVE_BINDING remains pending")
+	require.Eventually(t, func() bool {
+		manager.mu.RLock()
+		defer manager.mu.RUnlock()
+		return manager.sandboxes[request.Identity.SandboxUID] == metadata && metadata.Phase == sandboxStateDeleteFailed && !manager.createDeletePending[request.Identity.SandboxUID]
+	}, time.Second, 10*time.Millisecond, "the canceled image worker must finish before a later delete retry")
+	require.False(t, runtime.MockRuntime.GetDeleteCalled(), "worker cleanup must not bypass failed REMOVE")
+	caller.mu.Lock()
+	require.Equal(t, 1, caller.removeCalls, "the worker only reads back owner state; it must not retry REMOVE")
+	caller.failRemove = false
+	caller.mu.Unlock()
+
+	_, err = manager.DeleteSandboxContext(context.Background(), &fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+	require.NoError(t, err)
+	require.Eventually(t, runtime.MockRuntime.GetDeleteCalled, time.Second, 10*time.Millisecond, "a later Delete retries retirement then cleans the parked runtime")
+}
+
+func TestActionsV2ColdCreateDeleteQueuesCleanupAfterConcurrentRemoveAck(t *testing.T) {
+	deliveryEntered := make(chan struct{}, 1)
+	deliveryRelease := make(chan struct{})
+	var deliveryReleaseOnce sync.Once
+	releaseDelivery := func() { deliveryReleaseOnce.Do(func() { close(deliveryRelease) }) }
+	defer releaseDelivery()
+	runtime := &gatedDeleteBootRuntime{
+		asyncBootRuntime: newAsyncBootRuntime(ImageDelivering),
+		deliveryEntered:  deliveryEntered, deliveryRelease: deliveryRelease,
+	}
+	baseCaller := &strictDeleteActionCaller{}
+	removeRelease := make(chan struct{})
+	ownerReadRelease := make(chan struct{})
+	var removeReleaseOnce, ownerReadReleaseOnce sync.Once
+	releaseRemove := func() { removeReleaseOnce.Do(func() { close(removeRelease) }) }
+	releaseOwnerRead := func() { ownerReadReleaseOnce.Do(func() { close(ownerReadRelease) }) }
+	defer releaseRemove()
+	defer releaseOwnerRead()
+	caller := &blockingStrictDeleteActionCaller{
+		strictDeleteActionCaller: baseCaller,
+		removeEntered:            make(chan struct{}, 1), removeRelease: removeRelease, removeStarted: make(chan struct{}),
+		ownerReadEntered: make(chan struct{}, 1), ownerReadRelease: ownerReadRelease,
+	}
+	actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{
+		Name: "egress", TargetHTTPPort: 18080,
+	}}, actionapi.APIVersionV2, caller)
+	require.NoError(t, err)
+	probeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actionManager.Start(probeCtx)
+	require.Eventually(t, actionManager.Ready, time.Second, 10*time.Millisecond)
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", ActionManager: actionManager,
+	})
+	require.NoError(t, err)
+	request := ensureRequest("cold-v2-delete-race", 1, 1)
+	request.ActionBindings = []fastletapi.ActionBindingInput{{Handler: "egress", Input: `{}`}}
+	created, err := manager.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.RuntimeStateCreating, created.Sandbox.Runtime.State)
+	select {
+	case <-deliveryEntered:
+	case <-time.After(time.Second):
+		t.Fatal("cold create image worker did not enter delivery")
+	}
+
+	manager.mu.RLock()
+	metadata := manager.sandboxes[request.Identity.SandboxUID]
+	manager.mu.RUnlock()
+	baseCaller.mu.Lock()
+	baseCaller.owner, baseCaller.ownerSet = actionOwnerForTest(actionAttachment(metadata)), true
+	baseCaller.mu.Unlock()
+	deleteDone := make(chan error, 1)
+	go func() {
+		_, deleteErr := manager.DeleteSandboxContext(context.Background(), &fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+		deleteDone <- deleteErr
+	}()
+	select {
+	case <-caller.removeEntered:
+	case deleteErr := <-deleteDone:
+		t.Fatalf("Delete returned before strict REMOVE entered the Handler: %v", deleteErr)
+	case <-time.After(time.Second):
+		t.Fatal("strict REMOVE did not reach the Handler")
+	}
+	releaseDelivery()
+	select {
+	case <-caller.ownerReadEntered:
+	case <-time.After(time.Second):
+		t.Fatal("worker cleanup did not read back the owner while REMOVE was pending")
+	}
+	require.False(t, runtime.MockRuntime.GetDeleteCalled())
+
+	releaseRemove()
+	require.NoError(t, <-deleteDone)
+	require.Eventually(t, func() bool {
+		manager.mu.RLock()
+		defer manager.mu.RUnlock()
+		return manager.deleteRetryRequested[request.Identity.SandboxUID] == metadata
+	}, time.Second, 10*time.Millisecond, "an ACK arriving during the worker's stale read-back must queue a retry")
+	releaseOwnerRead()
+	require.Eventually(t, runtime.MockRuntime.GetDeleteCalled, time.Second, 10*time.Millisecond,
+		"the queued cleanup must re-read retirement and delete the parked runtime")
+}
+
+func TestRecoverRetriesStrictOwnerRetirementBeforeRuntimeCleanup(t *testing.T) {
+	identity := fastletapi.SandboxIdentity{
+		SandboxUID: "recover-v2", Namespace: "default", Name: "recover-v2", FastletPodUID: "pod-uid-a",
+		InstanceGeneration: 3, RuntimeInstanceID: "runtime-recover-v2", AssignmentAttempt: 2, RouteGeneration: 4,
+	}
+	metadata := &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{
+		Identity: identity, ActionsAPIVersion: actionapi.APIVersionV2,
+		Desired: fastletapi.SandboxDesiredSpec{Image: "alpine:latest"},
+	}, Phase: "running"}
+	baseRuntime := newAdmissionRuntime()
+	baseRuntime.managed = []*SandboxMetadata{metadata}
+	runtime := &recoveryAdmissionRuntime{admissionRuntime: baseRuntime}
+	cleanupCalls := 0
+	runtime.recoverFn = func(ctx context.Context, managed []*SandboxMetadata, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
+		require.Len(t, managed, 1)
+		if err := retireOwner(ctx, managed[0]); err != nil {
+			return err
+		}
+		cleanupCalls++
+		baseRuntime.mu.Lock()
+		baseRuntime.managed = nil
+		baseRuntime.mu.Unlock()
+		return nil
+	}
+	caller := &strictDeleteActionCaller{failRemove: true}
+	attachment := actionAttachment(metadata)
+	caller.owner, caller.ownerSet = actionOwnerForTest(attachment), true
+	actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{{
+		Name: "egress", TargetHTTPPort: 18080,
+	}}, actionapi.APIVersionV2, caller)
+	require.NoError(t, err)
+	probeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	actionManager.Start(probeCtx)
+	require.Eventually(t, actionManager.Ready, time.Second, 10*time.Millisecond)
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", ActionManager: actionManager,
+	})
+	require.NoError(t, err)
+
+	require.ErrorContains(t, manager.Recover(context.Background()), "injected strict REMOVE timeout")
+	require.Zero(t, cleanupCalls, "runtime resource cleanup must wait for exact-owner retirement")
+	require.False(t, manager.Ready())
+	caller.mu.Lock()
+	caller.failRemove = false
+	caller.mu.Unlock()
+	require.NoError(t, manager.Recover(context.Background()), "startup recovery must be retryable after owner retirement succeeds")
+	require.Equal(t, 1, cleanupCalls)
+	require.True(t, manager.Ready())
 }
 
 func TestActionsV2DeleteDoesNotDowngradeMissingOrUnknownRuntimeMode(t *testing.T) {

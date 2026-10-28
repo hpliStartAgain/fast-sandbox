@@ -269,3 +269,5 @@ resurrected by a delayed Create retry.
 - Input is persisted in the Sandbox CRD and is not a secret transport. Secret
   material needs a separate reference/credential design.
 - Inputs and diagnostics must not be logged by the platform by default.
+
+Strict v2 requests carry `mode: legacy`. An absent egress owner requires REMOVE to persist a retirement fence before runtime teardown; absence alone is not proof of retirement. Dead Firecracker recovery retires the same persisted owner before releasing resources, and preserves state on cleanup failure so recovery can retry. Same-UID rebind and live binding removal are unsupported in this slice.

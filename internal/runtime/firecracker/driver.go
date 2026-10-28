@@ -25,6 +25,7 @@ import (
 	"fast-sandbox/internal/nodecleanup"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/ocitemplate"
+	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 	"fast-sandbox/internal/runtime/firecracker/agent/hostready"
@@ -917,7 +918,7 @@ func (d *Driver) ListManagedSandboxes(_ context.Context) ([]*SandboxMetadata, er
 // RecoverRuntimeResources cleans up VMs that died with a Fastlet restart:
 // Firecracker processes are pod-local, so stale records are removed and
 // their slots released; surviving VMs are returned.
-func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata) error {
+func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	manager := d.networkManager
@@ -940,7 +941,20 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 		}
 		alive, probeErr := d.probeVM(ctx, state)
 		if probeErr != nil || !alive {
-			if manager != nil {
+			metadata := existingMetadata(state)
+			if retireOwner != nil {
+				if err := retireOwner(ctx, metadata); err != nil {
+					return fmt.Errorf("retire Action owner before recovering dead Firecracker sandbox %s: %w", state.Config.Identity.SandboxUID, err)
+				}
+			} else if version := state.Config.ActionsAPIVersion; version != "" && version != actionapi.APIVersion {
+				return fmt.Errorf("Actions apiVersion %q requires owner retirement before recovering dead Firecracker sandbox %s", version, state.Config.Identity.SandboxUID)
+			}
+			if manager != nil && state.Config.ActionsAPIVersion == actionapi.APIVersionV2 {
+				// Release also retries a Destroying slot; Lookup only sees Bound.
+				if err := manager.Release(ctx, d.networkOwner(&state.Config)); err != nil {
+					return fmt.Errorf("release retired Sandbox network slot: %w", err)
+				}
+			} else if manager != nil {
 				sandboxUID := state.Config.Identity.SandboxUID
 				if slot, exists := manager.Lookup(sandboxUID); exists {
 					_ = slot

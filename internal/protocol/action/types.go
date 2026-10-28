@@ -15,6 +15,7 @@ const HeaderOwner = "X-Fast-Sandbox-Owner"
 const (
 	OwnerStateCurrent = "current"
 	OwnerStateRetired = "retired"
+	OwnerStateAbsent  = "absent"
 )
 
 type Operation string
@@ -130,6 +131,7 @@ type SnapshotTransfer struct {
 }
 
 type Request struct {
+	Mode         string                `json:"mode,omitempty"`
 	APIVersion   string                `json:"apiVersion"`
 	Operation    Operation             `json:"operation"`
 	InvocationID string                `json:"invocationId"`
