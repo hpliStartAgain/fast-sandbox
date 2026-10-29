@@ -39,6 +39,10 @@ const (
 	maxRelayResponseSize = 128 << 10
 )
 
+// ErrOwnerRetired means this identity cannot be admitted again. Retrying the
+// same owner cannot make progress; a new runtime generation is required.
+var ErrOwnerRetired = errors.New("Sandbox owner is retired")
+
 type Caller interface {
 	Status(context.Context, int32, string) (actionapi.HandlerStatus, error)
 	Invoke(context.Context, int32, actionapi.Request) error
@@ -138,8 +142,10 @@ func (c *HTTPCaller) Relay(ctx context.Context, port int32, apiVersion string, o
 			return 0, nil, errors.New("Actions v2 relay requires a complete Sandbox owner")
 		}
 		path = v2RelayPath(path)
-	} else if apiVersion != actionapi.APIVersion || owner.SandboxUID == "" {
+	} else if apiVersion != actionapi.APIVersion {
 		return 0, nil, fmt.Errorf("unsupported Action apiVersion %q", apiVersion)
+	} else if owner.SandboxUID == "" {
+		return 0, nil, errors.New("Action relay requires a Sandbox UID")
 	}
 	if method == "" {
 		method = http.MethodPost
@@ -999,16 +1005,31 @@ func (m *Manager) ConfirmOwnerRetired(ctx context.Context, attachment Attachment
 // CheckCreateOwner consumes the durable retirement fence before runtime boot.
 // A current observation is not a claim that retirement is not in progress.
 func (m *Manager) CheckCreateOwner(ctx context.Context, attachment Attachment) error {
-	for _, handler := range m.handlers {
-		observed, err := m.observeOwner(ctx, handler.TargetHTTPPort, ownerFromAttachment(attachment))
-		if err != nil {
-			return err
-		}
-		if observed.State == actionapi.OwnerStateRetired {
-			return errors.New("Sandbox owner is retired")
-		}
+	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
+		return err
 	}
-	return nil
+	if m.APIVersion() != actionapi.APIVersionV2 || !ownerFromAttachment(attachment).Valid() {
+		return errors.New("Actions v2 create fence requires a complete Sandbox owner")
+	}
+	probeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var probes sync.WaitGroup
+	errs := make([]error, len(m.handlers))
+	for index, handler := range m.handlers {
+		probes.Go(func() {
+			observed, err := m.observeOwner(probeCtx, handler.TargetHTTPPort, ownerFromAttachment(attachment))
+			if err != nil {
+				errs[index] = fmt.Errorf("check Action Handler %s owner retirement fence: %w", handler.Name, err)
+			} else if observed.State == actionapi.OwnerStateRetired {
+				errs[index] = ErrOwnerRetired
+			}
+			if errs[index] != nil {
+				cancel()
+			}
+		})
+	}
+	probes.Wait()
+	return errors.Join(errs...)
 }
 
 func (m *Manager) deleteState(ctx context.Context, state *sandboxState, expected Attachment) error {
@@ -1018,6 +1039,11 @@ func (m *Manager) deleteState(ctx context.Context, state *sandboxState, expected
 	}
 	defer state.unlockOperations()
 	state.mu.Lock()
+	attachment, generation := state.attachment, state.desiredGeneration
+	if !sameOwner(attachment, expected) {
+		state.mu.Unlock()
+		return errors.New("Delete owner changed while waiting for Action operations")
+	}
 	if state.terminating && effectiveAPIVersion(expected.APIVersion) != actionapi.APIVersionV2 {
 		state.mu.Unlock()
 		return nil
@@ -1037,24 +1063,12 @@ func (m *Manager) deleteState(ctx context.Context, state *sandboxState, expected
 			}
 		}
 	}
-	attachment, generation := state.attachment, state.desiredGeneration
-	if !sameOwner(attachment, expected) {
-		state.mu.Unlock()
-		return errors.New("Delete owner changed while waiting for Action operations")
-	}
 	state.mu.Unlock()
 	if effectiveAPIVersion(attachment.APIVersion) == actionapi.APIVersionV2 {
-		if len(order) == 0 {
-			if err := m.deleteRemoteOwner(ctx, attachment, generation); err != nil {
-				return err
-			}
-			m.finishDelete(sandboxUID, state, attachment)
-			return nil
-		}
-		for index := len(order) - 1; index >= 0; index-- {
-			if err := m.deleteRemoteHandler(ctx, order[index], attachment, generation); err != nil {
-				return err
-			}
+		// Retirement and its confirmation cover every declared Handler, including
+		// unbound Handlers and SETs whose ACK was lost before local recording.
+		if err := m.deleteRemoteOwner(ctx, attachment, generation); err != nil {
+			return err
 		}
 		m.finishDelete(sandboxUID, state, attachment)
 		return nil
@@ -1273,7 +1287,7 @@ func (m *Manager) getOrCreateState(attachment Attachment) (*sandboxState, error)
 	defer m.mu.Unlock()
 	if terminalAttachment, found := m.terminal[attachment.SandboxUID]; found {
 		if !attachmentAfter(attachment, terminalAttachment) {
-			return nil, errors.New("Action Binding state is terminal for this runtime attachment")
+			return nil, fmt.Errorf("Action Binding state is terminal for this runtime attachment: %w", ErrOwnerRetired)
 		}
 	}
 	state := m.states[attachment.SandboxUID]

@@ -11,6 +11,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	fastletaction "fast-sandbox/internal/fastlet/action"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	"fast-sandbox/internal/observability"
@@ -261,9 +262,13 @@ func (m *SandboxManager) registerDesiredBindings(ctx context.Context, placeholde
 		sandboxUID := placeholder.Config.Identity.SandboxUID
 		if m.sandboxes[sandboxUID] == placeholder {
 			delete(m.sandboxes, sandboxUID)
+			delete(m.createDeletePending, sandboxUID)
 		}
 		admission := m.admissionStatusLocked()
 		m.mu.Unlock()
+		if errors.Is(err, fastletaction.ErrOwnerRetired) {
+			return fastletErrorWithCause(fastletapi.ErrorGenerationFenced, err.Error(), false, err), admission
+		}
 		return fastletErrorWithCause(fastletapi.ErrorActionUnavailable, err.Error(), strict, err), admission
 	}
 	return nil, fastletapi.AdmissionStatus{}
@@ -352,9 +357,6 @@ func (m *SandboxManager) commitRuntimeCreate(req *fastletapi.CreateSandboxReques
 		m.sandboxes[sandboxUID] = metadata
 		strictActions := m.requiresStrictActionHandling(metadata.Config.ActionsAPIVersion)
 		delete(m.createDeletePending, sandboxUID)
-		if strictActions {
-			metadata.Phase = sandboxStateDeleting
-		}
 		admission := m.admissionStatusLocked()
 		if strictActions {
 			go m.finishStrictCreateDelete(metadata)
@@ -398,6 +400,13 @@ func (m *SandboxManager) finishStrictCreateDelete(metadata *SandboxMetadata) {
 		m.mu.Unlock()
 		return
 	}
+	m.mu.Lock()
+	if m.sandboxes[metadata.Config.Identity.SandboxUID] != metadata {
+		m.mu.Unlock()
+		return
+	}
+	metadata.Phase = sandboxStateDeleting
+	m.mu.Unlock()
 	m.asyncDelete(metadata.Config.Identity.SandboxUID, metadata)
 }
 
@@ -595,9 +604,7 @@ func (m *SandboxManager) DeleteSandboxContext(ctx context.Context, req *fastleta
 	}
 	ownerMetadata := metadata
 	if metadata == nil && strictActions {
-		ownerMetadata = &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{
-			Identity: req.Identity, ActionsAPIVersion: m.actionManager.APIVersion(),
-		}}
+		ownerMetadata = absentDeleteOwner(req.Identity, m.actionManager.APIVersion())
 	}
 	if metadata != nil {
 		if failure := validateIdentityFence(m.fastletPodUID, metadata, req.Identity); failure != nil {
@@ -653,31 +660,48 @@ func (m *SandboxManager) DeleteSandboxContext(ctx context.Context, req *fastleta
 			m.recordDiagnostic(req.Identity.SandboxUID, "error", "action", "delete-best-effort-failed", fmt.Sprintf("best-effort delete of Sandbox Action Bindings failed: %v", err))
 		}
 	}
+	m.dispatchDeleteAfterRetirement(req.Identity.SandboxUID, metadata, strictActions, wasCreating)
+	admission, _, _ := m.State()
+	return &fastletapi.DeleteSandboxResponse{Admission: admission}, nil
+}
+
+// absentDeleteOwner uses the same initial route generation as fresh Create.
+func absentDeleteOwner(identity fastletapi.SandboxIdentity, apiVersion string) *SandboxMetadata {
+	if identity.RouteGeneration <= 0 {
+		identity.RouteGeneration = 1
+	}
+	return &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{
+		Identity: identity, ActionsAPIVersion: apiVersion,
+	}}
+}
+
+// dispatchDeleteAfterRetirement transfers cleanup from Create to the deletion
+// worker only after the caller has established the required owner fence.
+func (m *SandboxManager) dispatchDeleteAfterRetirement(sandboxUID string, metadata *SandboxMetadata, strictActions, wasCreating bool) {
 	if metadata != nil && !wasCreating {
-		if strictActions {
-			m.mu.Lock()
-			if m.sandboxes[req.Identity.SandboxUID] == metadata {
+		m.mu.Lock()
+		if m.sandboxes[sandboxUID] == metadata {
+			delete(m.createDeletePending, sandboxUID)
+			if strictActions {
 				metadata.Phase = sandboxStateDeleting
 			}
-			m.mu.Unlock()
 		}
-		go m.asyncDelete(req.Identity.SandboxUID, metadata)
+		m.mu.Unlock()
+		go m.asyncDelete(sandboxUID, metadata)
 	} else if metadata != nil && strictActions && wasCreating {
 		// A canceled image worker can finish its one cleanup attempt while
 		// REMOVE_BINDING is still in flight. If it observed the owner as current,
 		// queue cleanup again after this caller has received the retirement ACK.
 		m.mu.Lock()
-		startCleanup := m.sandboxes[req.Identity.SandboxUID] == metadata && !m.createDeletePending[req.Identity.SandboxUID]
+		startCleanup := m.sandboxes[sandboxUID] == metadata && !m.createDeletePending[sandboxUID]
 		if startCleanup {
 			metadata.Phase = sandboxStateDeleting
 		}
 		m.mu.Unlock()
 		if startCleanup {
-			go m.asyncDelete(req.Identity.SandboxUID, metadata)
+			go m.asyncDelete(sandboxUID, metadata)
 		}
 	}
-	admission, _, _ := m.State()
-	return &fastletapi.DeleteSandboxResponse{Admission: admission}, nil
 }
 
 func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit // pre-existing recovery sequence; refactor tracked separately

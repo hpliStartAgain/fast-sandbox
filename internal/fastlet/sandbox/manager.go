@@ -511,6 +511,7 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 		})
 		delete(m.sandboxes, sandboxID)
 		delete(m.runtimeMessages, sandboxID)
+		delete(m.createDeletePending, sandboxID)
 		m.cacheProtection.Unprotect(expected.Config.Desired.Image, fastletcache.ProtectActive)
 		m.cacheProtection.ProtectHotUntil(expected.Config.Desired.Image, m.clock.Now().Add(time.Hour))
 		m.recordDiagnosticLocked(sandboxID, "info", "fastlet", "deleted", "proxy route and runtime resources were deleted")
